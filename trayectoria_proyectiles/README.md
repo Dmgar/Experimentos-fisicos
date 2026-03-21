@@ -1,9 +1,5 @@
-
----
-
 ###  Contenido B - `trayectoria_proyectiles/README.md`
 
-```markdown
 # Trayectoria de Proyectiles
 
 ## Descripción
@@ -30,5 +26,6 @@ Simulación numérica y análisis de trayectorias parabólicas de proyectiles, i
 - Determinación del ángulo óptimo para máximo alcance
 
 ## Requisitos
-```bash
+
+bash
 pip install numpy matplotlib scipy jupyter
