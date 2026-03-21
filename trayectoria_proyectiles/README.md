@@ -1,5 +1,3 @@
-###  Contenido B - `trayectoria_proyectiles/README.md`
-
 # Trayectoria de Proyectiles
 
 ## Descripción
