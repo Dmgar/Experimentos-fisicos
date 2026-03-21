@@ -27,5 +27,5 @@ Simulación numérica y análisis de trayectorias parabólicas de proyectiles, i
 
 ## Requisitos
 
-bash
+```bash
 pip install numpy matplotlib scipy jupyter
