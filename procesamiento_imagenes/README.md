@@ -1,6 +1,3 @@
-### 📄 Contenido C - `procesamiento_imagenes/README.md`
-
-markdown
 # Procesamiento de Imágenes
 
 ## Descripción
@@ -27,7 +24,7 @@ Herramientas para extraer datos físicos a partir de imágenes y videos de exper
 
 ## Ejemplo de uso
 
-python
+```python
 
 # Extraer trayectoria de un video
 
