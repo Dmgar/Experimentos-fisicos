@@ -59,11 +59,15 @@
   - **Resonancia Forzada:** Amplitud en función de la frecuencia de excitación $\omega_f$ y espectro FFT.
 
 ### 4. Percepción & Detección Óptica de Movimiento (OpenCV)
-- Extracción de trayectoria en coordenadas físicas a partir de video experimental:
-  - Aislamiento en espacio de color **HSV**.
-  - Operaciones morfológicas y cálculo analítico de centroides mediante momentos de Hu.
-  - Calibración métrica (Píxeles por Metro, PPM).
-  - Suavizado polinomial con filtro **Savitzky-Golay** y algoritmo de detección de picos para inferir el periodo experimental y el coeficiente de amortiguamiento $R^2$.
+- Extracción de trayectoria en coordenadas físicas a partir de video experimental de laboratorio (grabaciones de celular / cámaras reales):
+  - **Detección Robusta**: *Template Matching* multiescala normalizado con respaldo por diferenciación de fondo adaptativo (**MOG2**).
+  - **Interpolación Cinemática**: Filtrado de oclusiones y eliminación de ruido con trayectorias físicamente interpoladas libres de `NaN`.
+  - **Ajuste Armónico por PCA**: Proyección cinemática sobre el autovector dominante $s(t) = \mathbf{u}_1 \cdot (\mathbf{x} - \bar{\mathbf{x}})$, evaluación multieje ($s(t), x(t), y(t)$) y descarte dinámico del transitorio de soltado ($0-25\%$).
+  - **Sincronización Cuadro a Cuadro en Canvas**: Reproductor de video real integrado con *letterboxing* anamórfico que alinea la retícula óptica, la mira telescópica, el vector de velocidad instantáneo y la estela esmeralda sobre el objeto físico.
+  - **Validación Experimental en Videos Reales**:
+    - **Muestra 1 (Oscilación Horizontal)**: $R^2 = 0.9982$, Confianza $99.6\%$, $T = 1.918\text{ s}$ (`PENDULO_SIMPLE`).
+    - **Muestra 2 (Oscilación Vertical en Cámara)**: $R^2 = 0.9988$, Confianza $99.6\%$, $T = 1.104\text{ s}$ (`PENDULO_SIMPLE`).
+
 
 ---
 
