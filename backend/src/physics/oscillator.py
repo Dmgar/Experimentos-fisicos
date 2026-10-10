@@ -3,7 +3,32 @@
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Literal
 import numpy as np
-from scipy.integrate import solve_ivp
+
+try:
+    from scipy.integrate import solve_ivp
+    _HAS_SCIPY_INT = True
+except Exception:
+    _HAS_SCIPY_INT = False
+
+
+def _rk4_oscillator_solve(fun, initial_state: List[float], t_eval: np.ndarray) -> np.ndarray:
+    n_pts = len(t_eval)
+    y = np.zeros((n_pts, 2), dtype=float)
+    y[0] = initial_state
+
+    for i in range(n_pts - 1):
+        t = t_eval[i]
+        dt = t_eval[i + 1] - t
+        curr_y = y[i]
+
+        k1 = np.array(fun(t, curr_y), dtype=float)
+        k2 = np.array(fun(t + dt * 0.5, curr_y + dt * 0.5 * k1), dtype=float)
+        k3 = np.array(fun(t + dt * 0.5, curr_y + dt * 0.5 * k2), dtype=float)
+        k4 = np.array(fun(t + dt, curr_y + dt * k3), dtype=float)
+
+        y[i + 1] = curr_y + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    return y.T
 
 
 @dataclass
@@ -59,74 +84,83 @@ class OscillatorSimulator:
             omega_d = 0.0
         elif zeta < 1.0:
             regime = "underdamped"
-            regime_label = f"Subamortiguado (ζ = {zeta:.3f} < 1.0)"
-            omega_d = float(omega0 * np.sqrt(1.0 - zeta**2))
+            regime_label = "Subamortiguado (ζ < 1.0, oscilaciones armónicas)"
+            omega_d = omega0 * np.sqrt(1.0 - (zeta**2))
         else:
             regime = "overdamped"
-            regime_label = f"Sobreamortiguado (ζ = {zeta:.3f} > 1.0)"
+            regime_label = "Sobreamortiguado (ζ > 1.0, decaimiento aperiódico)"
             omega_d = 0.0
 
-        def ode_system(t: float, state: np.ndarray) -> list:
-            x_val, v_val = state
-            # m * a + b * v + k * x = F0 * cos(omega_f * t)
-            f_ext = p.driving_force * np.cos(p.driving_freq * t) if p.driving_force > 0 else 0.0
-            a_val = (f_ext - b * v_val - k * x_val) / m
-            return [v_val, a_val]
+        # Ecuación diferencial: m*x'' + b*x' + k*x = F0*cos(omega_f*t)
+        def osc_derivatives(t: float, state: np.ndarray) -> list:
+            x, v = state
+            f_ext = p.driving_force * np.cos(p.driving_freq * t)
+            dxdt = v
+            dvdt = (f_ext - b * v - k * x) / m
+            return [dxdt, dvdt]
 
         t_eval = np.linspace(0, p.t_max, p.num_points)
-        sol = solve_ivp(
-            fun=ode_system,
-            t_span=(0, p.t_max),
-            y0=[p.x0, p.v0],
-            t_eval=t_eval,
-            method="RK45",
-            rtol=1e-8,
-            atol=1e-10,
-        )
+        initial_state = [p.x0, p.v0]
 
-        t_arr = sol.t
-        x_arr = sol.y[0]
-        v_arr = sol.y[1]
+        used_rk4 = True
+        if _HAS_SCIPY_INT:
+            try:
+                sol = solve_ivp(
+                    fun=osc_derivatives,
+                    t_span=(0, p.t_max),
+                    y0=initial_state,
+                    t_eval=t_eval,
+                    method="RK45",
+                    rtol=1e-8,
+                    atol=1e-10,
+                )
+                x_arr = sol.y[0]
+                v_arr = sol.y[1]
+                used_rk4 = False
+            except Exception:
+                used_rk4 = True
 
-        f_ext_arr = p.driving_force * np.cos(p.driving_freq * t_arr) if p.driving_force > 0 else 0.0
+        if used_rk4:
+            y_sol = _rk4_oscillator_solve(osc_derivatives, initial_state, t_eval)
+            x_arr = y_sol[0]
+            v_arr = y_sol[1]
+
+        # Aceleración y Energías
+        f_ext_arr = p.driving_force * np.cos(p.driving_freq * t_eval)
         a_arr = (f_ext_arr - b * v_arr - k * x_arr) / m
 
-        # Energías
-        kinetic = 0.5 * m * (v_arr ** 2)
-        potential = 0.5 * k * (x_arr ** 2)
-        total = kinetic + potential
+        k_energy = 0.5 * m * (v_arr**2)
+        p_energy = 0.5 * k * (x_arr**2)
+        tot_energy = k_energy + p_energy
 
-        # 1. Curva de resonancia teórica (Amplitud en función de frecuencia forzada)
-        freq_sweep = np.linspace(0.1, max(omega0 * 2.5, 10.0), 40)
-        f0_val = max(p.driving_force, 1.0)
-        res_curve = []
-        for w in freq_sweep:
-            denom = np.sqrt((omega0**2 - w**2)**2 + (2 * zeta * omega0 * w)**2)
-            amp = float((f0_val / m) / max(denom, 1e-4))
-            res_curve.append({"freq": round(float(w), 2), "amplitude": round(amp, 4)})
-
-        # 2. FFT del desplazamiento
-        dt = p.t_max / max(p.num_points - 1, 1)
-        fft_vals = np.abs(np.fft.rfft(x_arr - np.mean(x_arr)))
+        # FFT para espectro de frecuencias
+        dt = p.t_max / max(p.num_points, 1)
+        fft_vals = np.abs(np.fft.rfft(x_arr))
         fft_freqs = np.fft.rfftfreq(len(x_arr), d=dt)
-        # Normalizar espectro
-        fft_norm = fft_vals / max(np.max(fft_vals), 1e-6)
+
+        # Curva de resonancia teórica (amplitud en función de omega_f)
+        omega_scan = np.linspace(0.1, omega0 * 2.5, 40)
+        res_curve = []
+        for w in omega_scan:
+            denom = np.sqrt(((omega0**2 - w**2)**2) + ((2 * zeta * omega0 * w)**2))
+            amp = (p.driving_force / m) / max(denom, 1e-4) if p.driving_force > 0 else 1.0 / max(denom, 1e-4)
+            res_curve.append({"omega": round(float(w), 3), "amplitude": round(float(amp), 4)})
 
         return OscillatorResult(
             params=asdict(p),
-            t=[round(float(v), 4) for v in t_arr],
+            t=[round(float(v), 4) for v in t_eval],
             x=[round(float(v), 4) for v in x_arr],
             v=[round(float(v), 4) for v in v_arr],
             a=[round(float(v), 4) for v in a_arr],
-            kinetic_energy=[round(float(v), 5) for v in kinetic],
-            potential_energy=[round(float(v), 5) for v in potential],
-            total_energy=[round(float(v), 5) for v in total],
-            omega_natural=round(float(omega0), 3),
+            kinetic_energy=[round(float(v), 4) for v in k_energy],
+            potential_energy=[round(float(v), 4) for v in p_energy],
+            total_energy=[round(float(v), 4) for v in tot_energy],
+            omega_natural=round(float(omega0), 4),
             damping_ratio=round(float(zeta), 4),
             regime=regime,
             regime_label=regime_label,
-            damped_frequency=round(float(omega_d), 3),
+            damped_frequency=round(float(omega_d), 4),
             resonance_curve=res_curve,
-            fft_freqs=[round(float(f), 3) for f in fft_freqs[:40]],
-            fft_amplitudes=[round(float(a), 4) for a in fft_norm[:40]],
+            fft_freqs=[round(float(f), 3) for f in fft_freqs[:50]],
+            fft_amplitudes=[round(float(a), 4) for a in fft_vals[:50]],
         )

@@ -3,8 +3,44 @@
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Tuple
 import numpy as np
-from scipy.integrate import solve_ivp
-from scipy.signal import find_peaks
+
+# Intentar importar scipy; si está restringido por directiva de SO, usar solver RK4 numérico
+try:
+    from scipy.integrate import solve_ivp
+    _HAS_SCIPY_INT = True
+except Exception:
+    _HAS_SCIPY_INT = False
+
+
+def _rk4_solve(fun, t_span: Tuple[float, float], y0: List[float], t_eval: np.ndarray) -> np.ndarray:
+    """Integrador numérico Runge-Kutta de 4to orden (RK4) de alta precisión."""
+    n_pts = len(t_eval)
+    n_vars = len(y0)
+    y = np.zeros((n_pts, n_vars), dtype=float)
+    y[0] = y0
+
+    for i in range(n_pts - 1):
+        t = t_eval[i]
+        dt = t_eval[i + 1] - t
+        curr_y = y[i]
+
+        k1 = np.array(fun(t, curr_y), dtype=float)
+        k2 = np.array(fun(t + dt * 0.5, curr_y + dt * 0.5 * k1), dtype=float)
+        k3 = np.array(fun(t + dt * 0.5, curr_y + dt * 0.5 * k2), dtype=float)
+        k4 = np.array(fun(t + dt, curr_y + dt * k3), dtype=float)
+
+        y[i + 1] = curr_y + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    return y.T
+
+
+def _find_peaks_np(arr: np.ndarray, distance: int = 5) -> np.ndarray:
+    peaks = []
+    for i in range(1, len(arr) - 1):
+        if arr[i] > arr[i - 1] and arr[i] > arr[i + 1]:
+            if not peaks or (i - peaks[-1]) >= distance:
+                peaks.append(i)
+    return np.array(peaks, dtype=int)
 
 
 @dataclass
@@ -45,8 +81,6 @@ class PendulumSimulator:
     def derivatives(t: float, state: np.ndarray, L: float, g: float, m: float, b: float) -> list:
         theta, omega = state
         dtheta_dt = omega
-        # d^2(theta)/dt^2 = - (b / (m * L^2)) * omega - (g / L) * sin(theta)
-        # amortiguamiento angular equivalente: b_eff = b / m
         domega_dt = - (b / max(m, 1e-6)) * omega - (g / max(L, 1e-6)) * np.sin(theta)
         return [dtheta_dt, domega_dt]
 
@@ -56,64 +90,79 @@ class PendulumSimulator:
         initial_state = [theta0_rad, p.omega0]
         t_eval = np.linspace(0, p.t_max, p.num_points)
 
-        sol = solve_ivp(
-            fun=lambda t, y: cls.derivatives(t, y, p.length, p.gravity, p.mass, p.damping),
-            t_span=(0, p.t_max),
-            y0=initial_state,
-            t_eval=t_eval,
-            method="RK45",
-            rtol=1e-8,
-            atol=1e-10,
-        )
+        fun = lambda t, y: cls.derivatives(t, y, p.length, p.gravity, p.mass, p.damping)
 
-        t = sol.t
-        theta = sol.y[0]
-        omega = sol.y[1]
+        if _HAS_SCIPY_INT:
+            try:
+                sol = solve_ivp(
+                    fun=fun,
+                    t_span=(0, p.t_max),
+                    y0=initial_state,
+                    t_eval=t_eval,
+                    method="RK45",
+                    rtol=1e-8,
+                    atol=1e-10,
+                )
+                theta = sol.y[0]
+                omega = sol.y[1]
+            except Exception:
+                sol_y = _rk4_solve(fun, (0, p.t_max), initial_state, t_eval)
+                theta = sol_y[0]
+                omega = sol_y[1]
+        else:
+            sol_y = _rk4_solve(fun, (0, p.t_max), initial_state, t_eval)
+            theta = sol_y[0]
+            omega = sol_y[1]
 
         # Aceleración angular
         alpha = - (p.damping / max(p.mass, 1e-6)) * omega - (p.gravity / max(p.length, 1e-6)) * np.sin(theta)
 
-        # Coordenadas cartesianas (origen en pivote, y hacia abajo negativo)
+        # Posiciones en coordenadas cartesianas (origen en el pivote, Y apunta hacia abajo)
         x = p.length * np.sin(theta)
-        y = -p.length * np.cos(theta)
+        y = p.length * (1.0 - np.cos(theta))
 
         # Energías
         v = p.length * omega
-        kinetic = 0.5 * p.mass * (v ** 2)
-        potential = p.mass * p.gravity * p.length * (1 - np.cos(theta))
-        total_energy = kinetic + potential
+        k_energy = 0.5 * p.mass * (v ** 2)
+        p_energy = p.mass * p.gravity * y
+        e_total = k_energy + p_energy
 
-        # Periodo teórico lineal: T0 = 2*pi*sqrt(L/g)
-        t0_linear = 2.0 * np.pi * np.sqrt(p.length / p.gravity)
+        # Periodos teóricos
+        t0 = 2.0 * np.pi * np.sqrt(p.length / max(p.gravity, 1e-6))
+        # Corrección de Borda / Legendre por amplitud finita
+        t_nonlinear = t0 * (1.0 + (1.0 / 16.0) * (theta0_rad ** 2) + (11.0 / 3072.0) * (theta0_rad ** 4))
 
-        # Corrección no lineal de Borda / Legendre para amplitudes finitas
-        t_nonlinear = t0_linear * (1.0 + (1.0 / 16.0) * (theta0_rad ** 2) + (11.0 / 3072.0) * (theta0_rad ** 4))
+        # Detección numérica de periodo
+        min_dist = max(3, int((t0 * 0.6) / (p.t_max / p.num_points)))
+        peaks = _find_peaks_np(theta, distance=min_dist)
 
-        # Detección numérica de periodo mediante picos
-        peaks, _ = find_peaks(theta, distance=max(5, int(p.num_points / (p.t_max / max(t0_linear, 0.1)) * 0.6)))
         if len(peaks) >= 2:
-            peak_times = t[peaks]
-            detected_period = float(np.mean(np.diff(peak_times)))
+            t_peaks = t_eval[peaks]
+            periods = np.diff(t_peaks)
+            detected_t = float(np.mean(periods))
+            amps = theta[peaks]
+            if len(amps) >= 2 and amps[0] > 1e-4:
+                decay = float(amps[1] / amps[0])
+            else:
+                decay = 1.0
         else:
-            detected_period = float(t_nonlinear)
-
-        # Razón de decaimiento
-        decay = float(np.max(np.abs(theta[-50:])) / max(abs(theta0_rad), 1e-6)) if p.damping > 0 else 1.0
+            detected_t = float(t_nonlinear)
+            decay = 1.0
 
         return PendulumResult(
             params=asdict(p),
-            t=[round(float(val), 4) for val in t],
-            theta=[round(float(val), 5) for val in theta],
-            theta_deg=[round(float(np.degrees(val)), 3) for val in theta],
-            omega=[round(float(val), 5) for val in omega],
-            alpha=[round(float(val), 5) for val in alpha],
-            x=[round(float(val), 4) for val in x],
-            y=[round(float(val), 4) for val in y],
-            kinetic_energy=[round(float(val), 5) for val in kinetic],
-            potential_energy=[round(float(val), 5) for val in potential],
-            total_energy=[round(float(val), 5) for val in total_energy],
-            period_theoretical_linear=round(float(t0_linear), 4),
-            period_nonlinear_approx=round(float(t_nonlinear), 4),
-            detected_period=round(float(detected_period), 4),
-            decay_ratio=round(float(decay), 4),
+            t=[round(float(v), 4) for v in t_eval],
+            theta=[round(float(v), 5) for v in theta],
+            theta_deg=[round(float(np.degrees(v)), 3) for v in theta],
+            omega=[round(float(v), 5) for v in omega],
+            alpha=[round(float(v), 5) for v in alpha],
+            x=[round(float(v), 4) for v in x],
+            y=[round(float(v), 4) for v in y],
+            kinetic_energy=[round(float(v), 5) for v in k_energy],
+            potential_energy=[round(float(v), 5) for v in p_energy],
+            total_energy=[round(float(v), 5) for v in e_total],
+            period_theoretical_linear=round(t0, 4),
+            period_nonlinear_approx=round(t_nonlinear, 4),
+            detected_period=round(detected_t, 4),
+            decay_ratio=round(decay, 4),
         )

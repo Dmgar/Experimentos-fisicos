@@ -122,3 +122,49 @@ export interface TrackingDemoResponse {
     peaks_times: number[];
   };
 }
+
+export interface VideoFrameDetection {
+  frame_idx: number;
+  time_s: number;
+  x_px: number;
+  y_px: number;
+  bbox: [number, number, number, number];
+  radius_px: number;
+  detected: boolean;
+}
+
+export interface PhysicalExperimentDiagnosis {
+  experiment_type: "PENDULO_SIMPLE" | "TIRO_PARABOLICO" | "OSCILADOR_AMORTIGUADO" | "CAIDA_LIBRE" | "NO_CLASIFICADO";
+  experiment_name_es: string;
+  confidence_pct: number;
+  is_valid_experiment: boolean;
+  r2_score: number;
+  summary_verdict: string;
+  detected_parameters: Record<string, any>;
+  theoretical_model: string;
+  all_scores: Record<string, number>;
+}
+
+export interface VideoAnalysisReport {
+  video_metadata: {
+    width: number;
+    height: number;
+    fps: number;
+    total_frames_analyzed: number;
+    duration_s: number;
+    detected_points_count: number;
+    tracking_mode: string;
+  };
+  detections: VideoFrameDetection[];
+  times: number[];
+  raw_x: number[];
+  raw_y: number[];
+  smooth_x: number[];
+  smooth_y: number[];
+  velocity_x: number[];
+  velocity_y: number[];
+  velocity_mag: number[];
+  theoretical_fit_x: number[];
+  theoretical_fit_y: number[];
+  diagnosis: PhysicalExperimentDiagnosis;
+}

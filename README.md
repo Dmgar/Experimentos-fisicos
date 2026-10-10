@@ -107,20 +107,20 @@ Experimentos-fisicos/
 - Python 3.11 o superior (`uv` recomendado)
 - Node.js 18 o superior (`npm`)
 
-### 1. Backend (FastAPI)
+### 1. Backend (FastAPI + SciPy + OpenCV)
 ```bash
 cd backend
 
-# Con uv (recomendado por velocidad):
-uv run uvicorn main:app --reload --port 8000
+# En Windows / sistemas con control de aplicaciones (recomendado):
+uv run python -m uvicorn main:app --reload --port 8000
 
-# O con pip estándar:
+# O con pip tradicional:
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --reload --port 8000
 ```
 La documentación interactiva Swagger estará disponible en: [http://localhost:8000/docs](http://localhost:8000/docs)
 
-### 2. Frontend (React + Vite)
+### 2. Frontend (React 19 + Vite + TypeScript)
 ```bash
 cd frontend
 npm install
@@ -128,10 +128,10 @@ npm run dev
 ```
 Abre en tu navegador: [http://localhost:5173](http://localhost:5173)
 
-### 3. Pruebas Unitarias
+### 3. Pruebas Unitarias Automatizadas
 ```bash
 cd backend
-python -m pytest tests/
+uv run python -m pytest tests/
 ```
 
 ### 4. Uso por Línea de Comandos (CLI)
