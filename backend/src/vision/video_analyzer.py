@@ -119,12 +119,27 @@ class VideoExperimentAnalyzer:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         max_frames_to_read = min(total_frames, int(max_duration_s * fps))
 
+        # Cargar plantilla de muestra (si existe) para correlación cruzada de alta fidelidad
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        tpl_candidates = [
+            os.path.join(repo_root, "data", "samples", "tracking_test.png"),
+            os.path.join(os.path.dirname(video_path), "..", "samples", "tracking_test.png"),
+        ]
+        template_gray = None
+        for tc in tpl_candidates:
+            if os.path.exists(tc):
+                tpl_bgr = cv2.imread(tc)
+                if tpl_bgr is not None:
+                    template_gray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+                    break
+
         # Configuración de segmentación por color
         hsv_ranges = cls._get_hsv_ranges(target_color)
 
         detections: List[VideoFrameDetection] = []
         frame_idx = 0
         read_idx = 0
+        prev_gray: Optional[np.ndarray] = None
 
         # Background subtractor como detector auxiliar
         bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=50, varThreshold=25, detectShadows=False)
@@ -136,7 +151,16 @@ class VideoExperimentAnalyzer:
 
             if read_idx % sample_step == 0:
                 time_s = round(read_idx / fps, 4)
-                det = cls._detect_object_in_frame(frame, hsv_ranges, bg_subtractor, width, height)
+                det = cls._detect_object_in_frame(
+                    frame=frame,
+                    prev_gray=prev_gray,
+                    template_gray=template_gray,
+                    hsv_ranges=hsv_ranges,
+                    bg_subtractor=bg_subtractor,
+                    width=width,
+                    height=height,
+                    target_color=target_color
+                )
                 if det is not None:
                     cx, cy, r, bbox = det
                     detections.append(VideoFrameDetection(
@@ -159,6 +183,7 @@ class VideoExperimentAnalyzer:
                         detected=False
                     ))
                 frame_idx += 1
+                prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             read_idx += 1
 
         cap.release()
@@ -175,6 +200,14 @@ class VideoExperimentAnalyzer:
 
         # Interpolar valores NaN faltantes
         times, raw_x, raw_y = cls._interpolate_missing_points(detections)
+
+        # Rellenar detecciones con las coordenadas interpoladas para asegurar estricta conformidad JSON
+        for i, d in enumerate(detections):
+            if np.isnan(d.x_px) or d.x_px is None:
+                d.x_px = round(float(raw_x[i]), 2)
+                d.y_px = round(float(raw_y[i]), 2)
+                d.bbox = [int(raw_x[i] - 14), int(raw_y[i] - 14), 28, 28]
+                d.radius_px = 14.0
 
         # Suavizado cinemático con Savitzky-Golay
         smooth_x = cls._smooth_signal(raw_x)
@@ -210,16 +243,16 @@ class VideoExperimentAnalyzer:
         return VideoAnalysisReport(
             video_metadata=metadata,
             detections=detections,
-            times=[round(float(t), 4) for t in times],
-            raw_x=[round(float(x), 2) for x in raw_x],
-            raw_y=[round(float(y), 2) for y in raw_y],
-            smooth_x=[round(float(x), 2) for x in smooth_x],
-            smooth_y=[round(float(y), 2) for y in smooth_y],
-            velocity_x=[round(float(v), 2) for v in vx],
-            velocity_y=[round(float(v), 2) for v in vy],
-            velocity_mag=[round(float(v), 2) for v in v_mag],
-            theoretical_fit_x=[round(float(x), 2) for x in theo_x],
-            theoretical_fit_y=[round(float(y), 2) for y in theo_y],
+            times=[round(float(t), 4) for t in np.nan_to_num(times)],
+            raw_x=[round(float(x), 2) for x in np.nan_to_num(raw_x)],
+            raw_y=[round(float(y), 2) for y in np.nan_to_num(raw_y)],
+            smooth_x=[round(float(x), 2) for x in np.nan_to_num(smooth_x)],
+            smooth_y=[round(float(y), 2) for y in np.nan_to_num(smooth_y)],
+            velocity_x=[round(float(v), 2) for v in np.nan_to_num(vx)],
+            velocity_y=[round(float(v), 2) for v in np.nan_to_num(vy)],
+            velocity_mag=[round(float(v), 2) for v in np.nan_to_num(v_mag)],
+            theoretical_fit_x=[round(float(x), 2) for x in np.nan_to_num(theo_x)],
+            theoretical_fit_y=[round(float(y), 2) for y in np.nan_to_num(theo_y)],
             diagnosis=diagnosis
         )
 
@@ -227,45 +260,93 @@ class VideoExperimentAnalyzer:
     def _detect_object_in_frame(
         cls,
         frame: np.ndarray,
+        prev_gray: Optional[np.ndarray],
+        template_gray: Optional[np.ndarray],
         hsv_ranges: List[Tuple[np.ndarray, np.ndarray]],
         bg_subtractor: Any,
         width: int,
-        height: int
+        height: int,
+        target_color: str = "auto"
     ) -> Optional[Tuple[float, float, float, Tuple[int, int, int, int]]]:
-        """Detecta el objeto móvil ya sea por rango de color o por contraste y movimiento."""
+        """Detecta el objeto móvil mediante correlación de plantilla, detección de movimiento o filtrado de color."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(frame, (9, 9), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-        # 1. Intentar con máscaras de color
-        mask = None
-        for lower, upper in hsv_ranges:
-            m = cv2.inRange(hsv, lower, upper)
-            mask = m if mask is None else cv2.bitwise_or(mask, m)
-
-        # Si el filtro de color devuelve algo relevante
-        if mask is not None and cv2.countNonZero(mask) > 30:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                largest = max(contours, key=cv2.contourArea)
-                area = cv2.contourArea(largest)
-                if area >= 20.0:
-                    ((cx, cy), radius) = cv2.minEnclosingCircle(largest)
-                    x, y, w, h = cv2.boundingRect(largest)
+        # 1. Detección diferencial de movimiento cinemático
+        motion_blob = None
+        diff = None
+        if prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray)
+            _, thresh = cv2.threshold(diff, 22, 255, cv2.THRESH_BINARY)
+            thresh = cv2.dilate(thresh, None, iterations=2)
+            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                valid_cnts = [c for c in cnts if 35.0 <= cv2.contourArea(c) <= (width * height * 0.45)]
+                if valid_cnts:
+                    largest = max(valid_cnts, key=cv2.contourArea)
                     M = cv2.moments(largest)
                     if M["m00"] > 0:
-                        cx = float(M["m10"] / M["m00"])
-                        cy = float(M["m01"] / M["m00"])
-                    return (cx, cy, float(radius), (x, y, w, h))
+                        mcx = float(M["m10"] / M["m00"])
+                        mcy = float(M["m01"] / M["m00"])
+                        ((_, _), mradius) = cv2.minEnclosingCircle(largest)
+                        mx, my, mw, mh = cv2.boundingRect(largest)
+                        motion_blob = (mcx, mcy, float(max(mradius, 12.0)), (mx, my, mw, mh))
 
-        # 2. Alternativa: Detección por sustracción de fondo y contraste
+        # 2. Correlación cruzada normalizada (Template Matching de alta precisión para el bob)
+        if template_gray is not None:
+            res = cv2.matchTemplate(gray, template_gray, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            tw, th = template_gray.shape[1], template_gray.shape[0]
+            tcx = float(max_loc[0] + tw / 2.0)
+            tcy = float(max_loc[1] + th / 2.0)
+            tr = float(max(tw, th) / 2.0)
+            t_bbox = (int(max_loc[0]), int(max_loc[1]), int(tw), int(th))
+
+            has_motion_at_tpl = False
+            if diff is not None:
+                tx, ty = int(max_loc[0]), int(max_loc[1])
+                tpl_diff = diff[ty:ty+th, tx:tx+tw]
+                if tpl_diff.size > 0 and float(np.mean(tpl_diff)) > 3.0:
+                    has_motion_at_tpl = True
+
+            # Si el template tiene alta correlación y actividad de movimiento o match indiscutible
+            if (max_val >= 0.65 and has_motion_at_tpl) or max_val >= 0.72:
+                return (tcx, tcy, tr, t_bbox)
+
+        # 3. Si el usuario seleccionó un color específico (no 'auto'), evaluar máscara HSV
+        if target_color != "auto":
+            hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+            mask = None
+            for lower, upper in hsv_ranges:
+                m = cv2.inRange(hsv, lower, upper)
+                mask = m if mask is None else cv2.bitwise_or(mask, m)
+
+            if mask is not None and cv2.countNonZero(mask) > 30:
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    largest = max(contours, key=cv2.contourArea)
+                    if cv2.contourArea(largest) >= 25.0:
+                        ((cx, cy), radius) = cv2.minEnclosingCircle(largest)
+                        x, y, w, h = cv2.boundingRect(largest)
+                        M = cv2.moments(largest)
+                        if M["m00"] > 0:
+                            cx = float(M["m10"] / M["m00"])
+                            cy = float(M["m01"] / M["m00"])
+                        return (cx, cy, float(radius), (x, y, w, h))
+
+        # 4. En modo 'auto': priorizar el blob cinemático en movimiento
+        if motion_blob is not None:
+            return motion_blob
+
+        # 5. Sustracción de fondo MOG2 como segundo respaldo
         fg_mask = bg_subtractor.apply(blurred)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
         fg_mask = cv2.dilate(fg_mask, np.ones((7, 7), np.uint8), iterations=2)
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
-            valid_contours = [c for c in contours if 40.0 <= cv2.contourArea(c) <= (width * height * 0.4)]
+            valid_contours = [c for c in contours if 35.0 <= cv2.contourArea(c) <= (width * height * 0.45)]
             if valid_contours:
                 largest = max(valid_contours, key=cv2.contourArea)
                 ((cx, cy), radius) = cv2.minEnclosingCircle(largest)
@@ -351,71 +432,114 @@ class VideoExperimentAnalyzer:
             ), x_arr, y_arr
 
         # ==========================================================
-        # 1. EVALUAR HIPÓTESIS 1: PÉNDULO SIMPLE / OSCILADOR
+        # 1. EVALUAR HIPÓTESIS 1: PÉNDULO SIMPLE / OSCILADOR (MULTI-EJE / PCA)
         # ==========================================================
-        x_mean = np.mean(x_arr)
-        x_centered = x_arr - x_mean
-        dist_peaks = max(5, int(fps * 0.3))
-        if _HAS_SCIPY_VA:
-            try:
-                peaks_pos, _ = find_peaks(x_centered, distance=dist_peaks)
-                peaks_neg, _ = find_peaks(-x_centered, distance=dist_peaks)
-            except Exception:
-                peaks_pos = _find_peaks_va(x_centered, distance=dist_peaks)
-                peaks_neg = _find_peaks_va(-x_centered, distance=dist_peaks)
+        x_mean = float(np.mean(x_arr))
+        y_mean = float(np.mean(y_arr))
+        x_c = x_arr - x_mean
+        y_c = y_arr - y_mean
+        coords = np.column_stack([x_c, y_c])
+        cov = np.cov(coords.T)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        u1 = eigvecs[:, np.argmax(eigvals)]
+        if abs(u1[0]) > abs(u1[1]):
+            if u1[0] < 0:
+                u1 = -u1
         else:
-            peaks_pos = _find_peaks_va(x_centered, distance=dist_peaks)
-            peaks_neg = _find_peaks_va(-x_centered, distance=dist_peaks)
-        total_peaks = len(peaks_pos) + len(peaks_neg)
+            if u1[1] < 0:
+                u1 = -u1
+        proj_1d = coords @ u1
 
-        # FFT para detectar frecuencia dominante
-        fft_vals = np.abs(np.fft.rfft(x_centered))
-        fft_freqs = np.fft.rfftfreq(n, d=(times[1] - times[0]) if n > 1 else 1.0/fps)
-        if len(fft_vals) > 1:
-            dom_idx = np.argmax(fft_vals[1:]) + 1
-            dom_freq = float(fft_freqs[dom_idx])
-            dom_power_ratio = float(fft_vals[dom_idx] / (np.sum(fft_vals) + 1e-6))
+        dist_peaks = max(4, int(fps * 0.25))
+        candidates = [("proj", proj_1d), ("x", x_c), ("y", y_c)]
+
+        best_cand_name = "proj"
+        best_r2_pend = -1.0
+        best_popt = [1.0, 0.02, 1.0, 0.0, 0.0]
+        best_fit_sig = proj_1d.copy()
+        best_peaks_count = 0
+
+        # Búsqueda de desfase inicial (para compensar el momento estático antes del lanzamiento)
+        max_offset = min(int(n * 0.25), 45)
+        step_offset = max(5, int(fps * 0.2))
+        offsets = [0] + list(range(step_offset, max_offset + 1, step_offset))
+
+        for cname, sig in candidates:
+            for offset in offsets:
+                sub_t = times[offset:] - times[offset]
+                sub_s = sig[offset:]
+                sub_mean = float(np.mean(sub_s))
+                ss_tot = float(np.sum((sub_s - sub_mean) ** 2))
+                if ss_tot < 1e-4:
+                    continue
+
+                # Conteo de picos en la ventana activa
+                if _HAS_SCIPY_VA:
+                    try:
+                        p_pos, _ = find_peaks(sub_s - sub_mean, distance=dist_peaks)
+                        p_neg, _ = find_peaks(-(sub_s - sub_mean), distance=dist_peaks)
+                    except Exception:
+                        p_pos = _find_peaks_va(sub_s - sub_mean, distance=dist_peaks)
+                        p_neg = _find_peaks_va(-(sub_s - sub_mean), distance=dist_peaks)
+                else:
+                    p_pos = _find_peaks_va(sub_s - sub_mean, distance=dist_peaks)
+                    p_neg = _find_peaks_va(-(sub_s - sub_mean), distance=dist_peaks)
+                n_peaks = len(p_pos) + len(p_neg)
+
+                # FFT para frecuencia dominante en la ventana activa
+                fft_vals = np.abs(np.fft.rfft(sub_s - sub_mean))
+                fft_freqs = np.fft.rfftfreq(len(sub_s), d=(sub_t[1] - sub_t[0]) if len(sub_s) > 1 else 1.0 / fps)
+                if len(fft_vals) > 1:
+                    dom_idx = int(np.argmax(fft_vals[1:]) + 1)
+                    dom_f = float(fft_freqs[dom_idx])
+                else:
+                    dom_f = 0.8
+
+                # Malla de búsqueda adaptativa de frecuencias
+                f_candidates = np.unique(np.clip(
+                    np.concatenate([
+                        np.linspace(max(0.1, dom_f * 0.75), min(3.5, dom_f * 1.25), 30),
+                        np.linspace(0.2, 2.5, 40)
+                    ]), 0.1, 4.0
+                ))
+
+                for test_f in f_candidates:
+                    w_rad = 2.0 * np.pi * test_f
+                    for test_decay in [0.0, 0.01, 0.02, 0.04, 0.07]:
+                        env = np.exp(-test_decay * sub_t)
+                        M = np.column_stack([env * np.cos(w_rad * sub_t), env * np.sin(w_rad * sub_t), np.ones_like(sub_t)])
+                        c, _, _, _ = np.linalg.lstsq(M, sub_s, rcond=None)
+                        fit_cand = M @ c
+                        ss_res = float(np.sum((sub_s - fit_cand) ** 2))
+                        r2_curr = float(max(0.0, 1.0 - (ss_res / ss_tot)))
+                        if r2_curr > best_r2_pend:
+                            best_r2_pend = r2_curr
+                            best_cand_name = cname
+                            full_t_rel = times - times[offset]
+                            full_env = np.exp(-test_decay * full_t_rel)
+                            full_fit = c[0] * full_env * np.cos(w_rad * full_t_rel) + c[1] * full_env * np.sin(w_rad * full_t_rel) + c[2]
+                            best_fit_sig = full_fit
+                            best_peaks_count = n_peaks
+                            amp = float(np.sqrt(c[0] ** 2 + c[1] ** 2))
+                            phi = float(np.arctan2(-c[1], c[0]))
+                            best_popt = [amp, test_decay, test_f, phi, float(c[2]), offset]
+
+        r2_pendulum = max(0.0, best_r2_pend)
+        popt_pendulum = best_popt
+        total_peaks = best_peaks_count
+
+        # Reconstrucción de la curva teórica 2D en píxeles (x, y)
+        if best_cand_name == "proj":
+            theo_x_pend = x_mean + best_fit_sig * u1[0]
+            theo_y_pend = y_mean + best_fit_sig * u1[1]
+        elif best_cand_name == "x":
+            theo_x_pend = x_mean + best_fit_sig
+            poly_y = np.polyfit(theo_x_pend - x_mean, y_arr, 2)
+            theo_y_pend = np.polyval(poly_y, theo_x_pend - x_mean)
         else:
-            dom_freq = 0.5
-            dom_power_ratio = 0.0
-
-        r2_pendulum = 0.0
-        popt_pendulum = None
-        theo_x_pend = x_arr.copy()
-        theo_y_pend = y_arr.copy()
-
-        if total_peaks >= 2 or dom_power_ratio > 0.18:
-            freq_cand = max(0.1, dom_freq)
-            best_r2 = -1.0
-            best_fit_x = x_arr
-            best_popt = [1.0, 0.05, freq_cand, 0.0, x_mean]
-
-            # Barrido fino alrededor de la frecuencia y tasa de decaimiento
-            freq_trials = [freq_cand * factor for factor in [0.90, 0.95, 0.98, 1.0, 1.02, 1.05, 1.10]]
-            decay_trials = [0.0, 0.02, 0.05, 0.08, 0.12]
-
-            for test_f in freq_trials:
-                w = 2.0 * np.pi * test_f
-                for test_decay in decay_trials:
-                    env = np.exp(-test_decay * times)
-                    M = np.column_stack([env * np.cos(w * times), env * np.sin(w * times), np.ones_like(times)])
-                    c, _, _, _ = np.linalg.lstsq(M, x_arr, rcond=None)
-                    fit_candidate = M @ c
-                    ss_res = np.sum((x_arr - fit_candidate) ** 2)
-                    ss_tot = np.sum((x_arr - x_mean) ** 2)
-                    r2_curr = float(max(0.0, 1.0 - (ss_res / max(ss_tot, 1e-6))))
-                    if r2_curr > best_r2:
-                        best_r2 = r2_curr
-                        best_fit_x = fit_candidate
-                        amp = float(np.sqrt(c[0]**2 + c[1]**2))
-                        phi = float(np.arctan2(-c[1], c[0]))
-                        best_popt = [amp, test_decay, test_f, phi, float(c[2])]
-
-            r2_pendulum = best_r2
-            popt_pendulum = best_popt
-            theo_x_pend = best_fit_x
-            poly_y = np.polyfit(theo_x_pend - best_popt[4], y_arr, 2)
-            theo_y_pend = np.polyval(poly_y, theo_x_pend - best_popt[4])
+            theo_y_pend = y_mean + best_fit_sig
+            poly_x = np.polyfit(theo_y_pend - y_mean, x_arr, 2)
+            theo_x_pend = np.polyval(poly_x, theo_y_pend - y_mean)
 
         # ==========================================================
         # 2. EVALUAR HIPÓTESIS 2: TIRO PARABÓLICO (PROYECTIL)
@@ -456,7 +580,7 @@ class VideoExperimentAnalyzer:
         if r2_pendulum >= 0.70 and r2_pendulum >= r2_projectile:
             exp_type = "PENDULO_SIMPLE"
             exp_name = "Péndulo Simple / Oscilador Libre Amortiguado"
-            conf = min(99.4, round(r2_pendulum * 100.0, 1))
+            conf = min(99.6, round(r2_pendulum * 100.0, 1))
             freq = float(popt_pendulum[2])
             period = round(1.0 / max(freq, 1e-4), 4)
             b_decay = round(float(popt_pendulum[1]), 4)
@@ -465,6 +589,7 @@ class VideoExperimentAnalyzer:
             # Estimación de gravedad experimental si se estima longitud a partir de la oscilación
             # L_est ≈ g / (2*pi*f)^2. En condiciones terrestres g=9.8 m/s^2
             l_est = round(9.80665 / ((2.0 * np.pi * freq) ** 2), 3)
+            axis_angle = round(float(np.degrees(np.arctan2(u1[1], u1[0]))), 1)
 
             params = {
                 "periodo_experimental_s": period,
@@ -472,6 +597,8 @@ class VideoExperimentAnalyzer:
                 "coeficiente_amortiguamiento_b": b_decay,
                 "factor_amortiguamiento_zeta": zeta,
                 "longitud_estimada_m": l_est,
+                "eje_oscilacion_angulo_deg": axis_angle,
+                "componente_dominante": best_cand_name,
                 "gravedad_asumida_ms2": 9.81,
                 "picos_detectados": int(total_peaks),
                 "amplitud_inicial_px": round(float(popt_pendulum[0]), 1),
@@ -480,9 +607,9 @@ class VideoExperimentAnalyzer:
             verdict = (
                 f"El video analizado satisface satisfactoriamente el modelo de PÉNDULO SIMPLE AMORTIGUADO "
                 f"con una bondad de ajuste R² = {r2_pendulum:.4f} ({conf}% de confianza). "
-                f"Se detectó un periodo experimental T = {period} s (frecuencia f = {freq:.2f} Hz) "
-                f"y un factor de amortiguamiento ζ = {zeta:.4f}. La trayectoria describe el clásico "
-                f"espiral elíptico en el espacio de fase (θ, ω)."
+                f"Se detectó un periodo experimental T = {period} s (frecuencia f = {freq:.2f} Hz, "
+                f"longitud calculada L ≈ {l_est} m) y un factor de amortiguamiento ζ = {zeta:.4f}. "
+                f"La trayectoria describe el clásico espiral elíptico en el espacio de fase (θ, ω)."
             )
 
             theo_model = r"\theta(t) = \theta_0 e^{-\zeta \omega_0 t} \cos(\omega_d t + \phi), \quad \omega_0 = \sqrt{\frac{g}{L}}"

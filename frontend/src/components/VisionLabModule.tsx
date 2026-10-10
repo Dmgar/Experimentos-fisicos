@@ -23,7 +23,10 @@ export const VisionLabModule: React.FC = () => {
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [selectedColor, setSelectedColor] = useState<string>("auto");
   const [activeTab, setActiveTab] = useState<"samples" | "upload" | "webcam">("samples");
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [selectedSample, setSelectedSample] = useState<string>("pendulo_muestra_2");
+  const [videoUrl, setVideoUrl] = useState<string | null>("/videos/pendulo_muestra_2.mp4");
+  const [videoReady, setVideoReady] = useState<boolean>(false);
+  const [chartAxis, setChartAxis] = useState<"auto" | "x" | "y">("auto");
 
   // Webcam recording states
   const [isRecording, setIsRecording] = useState<boolean>(false);
@@ -33,6 +36,7 @@ export const VisionLabModule: React.FC = () => {
   const chartCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const phaseCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const webcamVideoRef = useRef<HTMLVideoElement | null>(null);
+  const playbackVideoRef = useRef<HTMLVideoElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const animRef = useRef<number | null>(null);
@@ -43,13 +47,22 @@ export const VisionLabModule: React.FC = () => {
   }, []);
 
   const loadSample = async (sampleId: string) => {
+    setSelectedSample(sampleId);
     setIsLoading(true);
+    setVideoReady(false);
+    if (sampleId === "pendulo_muestra_2") {
+      setVideoUrl("/videos/pendulo_muestra_2.mp4");
+    } else if (sampleId === "pendulo_muestra_1") {
+      setVideoUrl("/videos/pendulo_muestra_1.mp4");
+    } else {
+      setVideoUrl(null);
+    }
+
     try {
       const data = await analyzeSampleVideo(sampleId, selectedColor);
       setReport(data);
       setActiveFrame(0);
       setIsPlaying(true);
-      setVideoUrl(null);
     } catch (err) {
       console.error("Error loading sample:", err);
       const fallback = localGenerateVideoReport(sampleId.includes("proyec") ? "TIRO_PARABOLICO" : "PENDULO_SIMPLE");
@@ -165,24 +178,85 @@ export const VisionLabModule: React.FC = () => {
     }
   }, [activeTab]);
 
-  // Loop de reproducción de fotogramas
+  // Manejador de Play/Pause
+  const handleTogglePlay = () => {
+    const next = !isPlaying;
+    setIsPlaying(next);
+    const vid = playbackVideoRef.current;
+    if (vid) {
+      if (next) {
+        vid.play().catch(() => {});
+      } else {
+        vid.pause();
+      }
+    }
+  };
+
+  // Reiniciar reproducción
+  const handleReset = () => {
+    setActiveFrame(0);
+    const vid = playbackVideoRef.current;
+    if (vid) {
+      vid.currentTime = 0;
+    }
+  };
+
+  // Scrubbing con el slider
+  const handleScrub = (val: number) => {
+    setActiveFrame(val);
+    setIsPlaying(false);
+    const vid = playbackVideoRef.current;
+    if (vid && report?.detections[val]) {
+      vid.pause();
+      vid.currentTime = report.detections[val].time_s;
+    }
+  };
+
+  // Sincronización de video y control Play/Pause
+  useEffect(() => {
+    const vid = playbackVideoRef.current;
+    if (!vid) return;
+    if (isPlaying) {
+      vid.play().catch(() => {});
+    } else {
+      vid.pause();
+    }
+  }, [isPlaying]);
+
+  useEffect(() => {
+    const vid = playbackVideoRef.current;
+    if (!vid || !videoUrl) return;
+    vid.currentTime = 0;
+    if (isPlaying) {
+      vid.play().catch(() => {});
+    }
+  }, [videoUrl]);
+
+  // Loop de reproducción sincronizada con el video nativo o timer sintético
   useEffect(() => {
     if (!isPlaying || !report || report.detections.length === 0) return;
 
-    let lastTime = performance.now();
+    let lastTickTime = performance.now();
     const fps = report.video_metadata.fps || 30;
-    const interval = 1000 / fps;
+    const intervalMs = 1000 / fps;
 
     const tick = (now: number) => {
-      if (now - lastTime >= interval) {
-        lastTime = now;
-        setActiveFrame((prev) => {
-          const next = prev + 1;
-          if (next >= report.detections.length) {
-            return 0;
-          }
-          return next;
-        });
+      const vid = playbackVideoRef.current;
+      if (vid && videoUrl && !vid.paused && !vid.ended) {
+        const curTime = vid.currentTime;
+        const targetIdx = Math.min(
+          report.detections.length - 1,
+          Math.max(0, Math.floor(curTime * fps))
+        );
+        setActiveFrame(targetIdx);
+      } else {
+        if (now - lastTickTime >= intervalMs) {
+          lastTickTime = now;
+          setActiveFrame((prev) => {
+            const next = prev + 1;
+            return next >= report.detections.length ? 0 : next;
+          });
+        }
       }
       animRef.current = requestAnimationFrame(tick);
     };
@@ -191,10 +265,10 @@ export const VisionLabModule: React.FC = () => {
     return () => {
       if (animRef.current) cancelAnimationFrame(animRef.current);
     };
-  }, [isPlaying, report]);
+  }, [isPlaying, report, videoUrl]);
 
-  // Dibujar Canvas del Rastreador de Visión Computacional
-  useEffect(() => {
+  // Dibujar Canvas del Rastreador de Visión Computacional (Video Real + Overlays Cinemáticos)
+  const drawTrackerCanvas = () => {
     const canvas = trackerCanvasRef.current;
     if (!canvas || !report || report.detections.length === 0) return;
     const ctx = canvas.getContext("2d");
@@ -207,40 +281,77 @@ export const VisionLabModule: React.FC = () => {
     const det = report.detections[activeFrame];
     if (!det) return;
 
-    // Fondo oscuro de laboratorio
-    ctx.fillStyle = "#060e18";
+    const vid = playbackVideoRef.current;
+
+    // Fondo profundo de laboratorio
+    ctx.fillStyle = "#030712";
     ctx.fillRect(0, 0, w, h);
 
-    // Cuadrícula óptica de laboratorio
-    ctx.strokeStyle = "rgba(0, 229, 255, 0.08)";
-    ctx.lineWidth = 1;
-    for (let x = 0; x < w; x += 40) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-      ctx.stroke();
+    // Relación de aspecto letterbox (para alinear perfectamente cámaras verticales u horizontales)
+    const vidW = report.video_metadata.width || vid?.videoWidth || 640;
+    const vidH = report.video_metadata.height || vid?.videoHeight || 420;
+    const scale = Math.min(w / vidW, h / vidH);
+    const renderW = vidW * scale;
+    const renderH = vidH * scale;
+    const offsetX = (w - renderW) / 2;
+    const offsetY = (h - renderH) / 2;
+
+    // 1. Dibujar fotograma de video real si está disponible
+    let hasDrawnVideo = false;
+    if (vid && vid.readyState >= 2 && videoUrl) {
+      try {
+        ctx.drawImage(vid, offsetX, offsetY, renderW, renderH);
+        hasDrawnVideo = true;
+
+        // Borde fino del encuadre del video
+        ctx.strokeStyle = "rgba(0, 229, 255, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(offsetX, offsetY, renderW, renderH);
+      } catch {
+        // En caso de fallo o seek pendiente
+      }
     }
-    for (let y = 0; y < h; y += 40) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(w, y);
-      ctx.stroke();
+
+    // 2. Si no hay video (simulación sintética), dibujar rejilla óptica
+    if (!hasDrawnVideo) {
+      ctx.strokeStyle = "rgba(0, 229, 255, 0.08)";
+      ctx.lineWidth = 1;
+      for (let x = 0; x < w; x += 40) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+      }
+      for (let y = 0; y < h; y += 40) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
     }
+
+    // Funciones de mapeo de coordenadas
+    const mapPx = (px: number) => offsetX + px * scale;
+    const mapPy = (py: number) => offsetY + py * scale;
 
     // Dibujar estela histórica (Trail de movimiento)
-    const trailLen = Math.min(activeFrame, 45);
+    const trailLen = Math.min(activeFrame, 50);
     if (trailLen > 1) {
       ctx.beginPath();
-      for (let i = activeFrame - trailLen; i <= activeFrame; i++) {
+      let started = false;
+      for (let i = Math.max(0, activeFrame - trailLen); i <= activeFrame; i++) {
         const p = report.detections[i];
         if (!p || !p.detected) continue;
-        const normX = (p.x_px / (report.video_metadata.width || 640)) * w;
-        const normY = (p.y_px / (report.video_metadata.height || 480)) * h;
-
-        if (i === activeFrame - trailLen) ctx.moveTo(normX, normY);
-        else ctx.lineTo(normX, normY);
+        const tx = mapPx(p.x_px);
+        const ty = mapPy(p.y_px);
+        if (!started) {
+          ctx.moveTo(tx, ty);
+          started = true;
+        } else {
+          ctx.lineTo(tx, ty);
+        }
       }
-      ctx.strokeStyle = "rgba(0, 255, 178, 0.65)";
+      ctx.strokeStyle = "rgba(0, 255, 178, 0.85)";
       ctx.lineWidth = 2.5;
       ctx.shadowColor = "#00ffb2";
       ctx.shadowBlur = 8;
@@ -249,9 +360,9 @@ export const VisionLabModule: React.FC = () => {
     }
 
     // Centroide actual
-    const curX = (det.x_px / (report.video_metadata.width || 640)) * w;
-    const curY = (det.y_px / (report.video_metadata.height || 480)) * h;
-    const radius = Math.max(10, (det.radius_px || 12) * (w / (report.video_metadata.width || 640)));
+    const curX = mapPx(det.x_px);
+    const curY = mapPy(det.y_px);
+    const radius = Math.max(8, (det.radius_px || 12) * scale);
 
     if (det.detected) {
       // Bounding Box del objeto detectado
@@ -279,41 +390,50 @@ export const VisionLabModule: React.FC = () => {
       ctx.stroke();
 
       // Vector de velocidad v
-      const vx = report.velocity_x[activeFrame] || 0;
-      const vy = report.velocity_y[activeFrame] || 0;
-      const arrowScale = 0.3;
-      const endX = curX + vx * arrowScale;
-      const endY = curY + vy * arrowScale;
+      const vx = (report.velocity_x[activeFrame] || 0) * scale;
+      const vy = (report.velocity_y[activeFrame] || 0) * scale;
+      const vMag = Math.sqrt(vx * vx + vy * vy);
+      if (vMag > 1.0) {
+        const arrowScale = 0.45;
+        const endX = curX + vx * arrowScale;
+        const endY = curY + vy * arrowScale;
 
-      ctx.beginPath();
-      ctx.moveTo(curX, curY);
-      ctx.lineTo(endX, endY);
-      ctx.strokeStyle = "#ff4d6d";
-      ctx.lineWidth = 2.5;
-      ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(curX, curY);
+        ctx.lineTo(endX, endY);
+        ctx.strokeStyle = "#ff4d6d";
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
 
-      // Punta de flecha
-      const angle = Math.atan2(vy, vx);
-      ctx.beginPath();
-      ctx.moveTo(endX, endY);
-      ctx.lineTo(endX - 8 * Math.cos(angle - Math.PI / 6), endY - 8 * Math.sin(angle - Math.PI / 6));
-      ctx.lineTo(endX - 8 * Math.cos(angle + Math.PI / 6), endY - 8 * Math.sin(angle + Math.PI / 6));
-      ctx.fillStyle = "#ff4d6d";
-      ctx.fill();
+        // Punta de flecha
+        const angle = Math.atan2(vy, vx);
+        ctx.beginPath();
+        ctx.moveTo(endX, endY);
+        ctx.lineTo(endX - 8 * Math.cos(angle - Math.PI / 6), endY - 8 * Math.sin(angle - Math.PI / 6));
+        ctx.lineTo(endX - 8 * Math.cos(angle + Math.PI / 6), endY - 8 * Math.sin(angle + Math.PI / 6));
+        ctx.fillStyle = "#ff4d6d";
+        ctx.fill();
+      }
 
-      // Etiqueta de coordenadas y velocidad en tiempo real
+      // Etiqueta de telemetría junto al centroide
+      ctx.fillStyle = "rgba(3, 7, 18, 0.85)";
+      ctx.fillRect(curX + radius + 6, curY - 14, 154, 30);
+      ctx.strokeStyle = "rgba(0, 229, 255, 0.4)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(curX + radius + 6, curY - 14, 154, 30);
+
       ctx.fillStyle = "#ffffff";
-      ctx.font = "11px 'Fira Code', monospace";
-      ctx.fillText(`Centroide: (${det.x_px.toFixed(1)} px, ${det.y_px.toFixed(1)} px)`, curX + radius + 8, curY - 6);
+      ctx.font = "10px 'Fira Code', monospace";
+      ctx.fillText(`(${det.x_px.toFixed(1)}, ${det.y_px.toFixed(1)}) px`, curX + radius + 10, curY - 2);
       ctx.fillStyle = "#00e5ff";
-      ctx.fillText(`|v|: ${(report.velocity_mag[activeFrame] || 0).toFixed(1)} px/s`, curX + radius + 8, curY + 10);
+      ctx.fillText(`|v|: ${(report.velocity_mag[activeFrame] || 0).toFixed(1)} px/s`, curX + radius + 10, curY + 11);
     }
 
     // Telemetría de fotograma (HUD superior)
-    ctx.fillStyle = "rgba(3, 9, 16, 0.85)";
-    ctx.fillRect(8, 8, 230, 68);
-    ctx.strokeStyle = "rgba(0, 229, 255, 0.3)";
-    ctx.strokeRect(8, 8, 230, 68);
+    ctx.fillStyle = "rgba(3, 7, 18, 0.88)";
+    ctx.fillRect(8, 8, 245, 72);
+    ctx.strokeStyle = "rgba(0, 229, 255, 0.4)";
+    ctx.strokeRect(8, 8, 245, 72);
 
     ctx.fillStyle = "#00ffb2";
     ctx.font = "bold 11px 'Fira Code', monospace";
@@ -321,9 +441,13 @@ export const VisionLabModule: React.FC = () => {
     ctx.fillStyle = "#8ba3c7";
     ctx.font = "10px 'Fira Code', monospace";
     ctx.fillText(`Frame: ${activeFrame + 1} / ${report.detections.length} (${det.time_s.toFixed(2)}s)`, 18, 42);
-    ctx.fillText(`Resolución: ${report.video_metadata.width}x${report.video_metadata.height} @ ${report.video_metadata.fps} FPS`, 18, 56);
+    ctx.fillText(`Resolución: ${vidW}x${vidH} @ ${report.video_metadata.fps || 30} FPS`, 18, 56);
     ctx.fillText(`Modelo: ${report.diagnosis.experiment_name_es}`, 18, 70);
-  }, [activeFrame, report]);
+  };
+
+  useEffect(() => {
+    drawTrackerCanvas();
+  }, [activeFrame, report, videoReady]);
 
   // Dibujar Gráfico Comparativo: Raw vs Suavizado Savitzky-Golay vs Modelo Teórico
   useEffect(() => {
@@ -345,9 +469,13 @@ export const VisionLabModule: React.FC = () => {
     const plotW = w - padX - 20;
     const plotH = h - padY * 2;
 
-    const raw = report.raw_x;
-    const smooth = report.smooth_x;
-    const theo = report.theoretical_fit_x;
+    const rangeYRaw = Math.max(...report.smooth_y) - Math.min(...report.smooth_y);
+    const rangeXRaw = Math.max(...report.smooth_x) - Math.min(...report.smooth_x);
+    const useY = chartAxis === "y" || (chartAxis === "auto" && rangeYRaw > rangeXRaw);
+
+    const raw = useY ? report.raw_y : report.raw_x;
+    const smooth = useY ? report.smooth_y : report.smooth_x;
+    const theo = useY ? report.theoretical_fit_y : report.theoretical_fit_x;
 
     const minX = Math.min(...raw, ...smooth, ...theo);
     const maxX = Math.max(...raw, ...smooth, ...theo);
@@ -430,9 +558,9 @@ export const VisionLabModule: React.FC = () => {
     ctx.strokeStyle = "#00ffb2";
     ctx.lineWidth = 2;
     ctx.stroke();
-  }, [report, activeFrame]);
+  }, [report, activeFrame, chartAxis]);
 
-  // Dibujar Espacio de Fase (x vs v_x)
+  // Dibujar Espacio de Fase
   useEffect(() => {
     const canvas = phaseCanvasRef.current;
     if (!canvas || !report || report.smooth_x.length === 0) return;
@@ -446,8 +574,12 @@ export const VisionLabModule: React.FC = () => {
     ctx.fillStyle = "#060e18";
     ctx.fillRect(0, 0, w, h);
 
-    const xs = report.smooth_x;
-    const vs = report.velocity_x;
+    const rangeYRaw = Math.max(...report.smooth_y) - Math.min(...report.smooth_y);
+    const rangeXRaw = Math.max(...report.smooth_x) - Math.min(...report.smooth_x);
+    const useY = chartAxis === "y" || (chartAxis === "auto" && rangeYRaw > rangeXRaw);
+
+    const xs = useY ? report.smooth_y : report.smooth_x;
+    const vs = useY ? report.velocity_y : report.velocity_x;
 
     const minX = Math.min(...xs);
     const maxX = Math.max(...xs);
@@ -476,7 +608,7 @@ export const VisionLabModule: React.FC = () => {
     ctx.shadowColor = "#00e5ff";
     ctx.shadowBlur = 6;
     ctx.beginPath();
-    for (let i = 0; i <= activeFrame; i++) {
+    for (let i = 0; i <= activeFrame && i < xs.length; i++) {
       const cx = mapPx(xs[i]);
       const cy = mapPv(vs[i]);
       if (i === 0) ctx.moveTo(cx, cy);
@@ -492,7 +624,7 @@ export const VisionLabModule: React.FC = () => {
       ctx.fillStyle = "#ffb020";
       ctx.fill();
     }
-  }, [report, activeFrame]);
+  }, [report, activeFrame, chartAxis]);
 
   return (
     <div className="module-container">
@@ -534,16 +666,28 @@ export const VisionLabModule: React.FC = () => {
       {/* Selector de Controles y Filtro de Color */}
       <div className="glass-card mb-4 controls-row">
         {activeTab === "samples" && (
-          <div className="flex-wrap-gap">
-            <span className="control-label">Muestras del Repositorio:</span>
-            <button className="btn-preset" onClick={() => loadSample("pendulo_muestra_2")}>
-              Péndulo Lab (Muestra 2)
+          <div className="flex-wrap-gap items-center">
+            <span className="control-label">Muestras del Laboratorio:</span>
+            <button
+              className={`btn-preset ${selectedSample === "pendulo_muestra_2" ? "btn-preset-active" : ""}`}
+              onClick={() => loadSample("pendulo_muestra_2")}
+              disabled={isLoading}
+            >
+              <Video size={14} className="text-cyan" /> Péndulo Real (Muestra 2 - Vertical)
             </button>
-            <button className="btn-preset" onClick={() => loadSample("pendulo_muestra_1")}>
-              Péndulo Lab (Muestra 1)
+            <button
+              className={`btn-preset ${selectedSample === "pendulo_muestra_1" ? "btn-preset-active" : ""}`}
+              onClick={() => loadSample("pendulo_muestra_1")}
+              disabled={isLoading}
+            >
+              <Video size={14} className="text-mint" /> Péndulo Real (Muestra 1 - Horizontal)
             </button>
-            <button className="btn-preset" onClick={() => loadSample("synthetic_projectile")}>
-              Tiro Parabólico
+            <button
+              className={`btn-preset ${selectedSample === "synthetic_projectile" ? "btn-preset-active" : ""}`}
+              onClick={() => loadSample("synthetic_projectile")}
+              disabled={isLoading}
+            >
+              <Sparkles size={14} className="text-orange" /> Tiro Parabólico (Benchmark)
             </button>
           </div>
         )}
@@ -601,6 +745,32 @@ export const VisionLabModule: React.FC = () => {
           </div>
 
           <div className="canvas-wrapper">
+            <video
+              ref={playbackVideoRef}
+              src={videoUrl || undefined}
+              playsInline
+              muted
+              loop
+              preload="auto"
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                width: "1px",
+                height: "1px",
+                opacity: 0.001,
+                pointerEvents: "none",
+                zIndex: -1,
+              }}
+              onLoadedData={() => {
+                setVideoReady(true);
+                if (isPlaying) {
+                  playbackVideoRef.current?.play().catch(() => {});
+                }
+              }}
+              onSeeked={() => {
+                drawTrackerCanvas();
+              }}
+            />
             {activeTab === "webcam" && (
               <video
                 ref={webcamVideoRef}
@@ -616,10 +786,10 @@ export const VisionLabModule: React.FC = () => {
 
           {/* Barra de Reproducción y Scrubbing */}
           <div className="playback-controls">
-            <button className="btn-icon" onClick={() => setIsPlaying(!isPlaying)} title={isPlaying ? "Pausar" : "Reproducir"}>
+            <button className="btn-icon" onClick={handleTogglePlay} title={isPlaying ? "Pausar" : "Reproducir"}>
               {isPlaying ? <Pause size={18} /> : <Play size={18} />}
             </button>
-            <button className="btn-icon" onClick={() => setActiveFrame(0)} title="Reiniciar">
+            <button className="btn-icon" onClick={handleReset} title="Reiniciar">
               <RotateCcw size={18} />
             </button>
 
@@ -628,10 +798,7 @@ export const VisionLabModule: React.FC = () => {
               min={0}
               max={Math.max(0, (report?.detections.length || 1) - 1)}
               value={activeFrame}
-              onChange={(e) => {
-                setActiveFrame(Number(e.target.value));
-                setIsPlaying(false);
-              }}
+              onChange={(e) => handleScrub(Number(e.target.value))}
               className="scrub-slider"
             />
 
@@ -737,17 +904,40 @@ export const VisionLabModule: React.FC = () => {
 
       {/* Gráficos Comparativos Inferiores */}
       <div className="grid-2col mt-4">
-        {/* Gráfico 1: Traza Temporal x(t) */}
+        {/* Gráfico 1: Traza Temporal Cinemática */}
         <div className="glass-card">
           <div className="card-top-bar">
             <div className="card-title-group">
               <Layers size={18} className="text-cyan" />
               <h3>Ajuste Cinemático: Raw vs Savitzky-Golay vs Modelo Teórico</h3>
             </div>
-            <div className="legend-pills">
-              <span className="pill pill-orange">Raw</span>
-              <span className="pill pill-purple">Teórico</span>
-              <span className="pill pill-mint">Savitzky-Golay</span>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+              <div className="axis-toggle-group">
+                <button
+                  className={`axis-toggle-btn ${chartAxis === "auto" ? "active" : ""}`}
+                  onClick={() => setChartAxis("auto")}
+                  title="Seleccionar eje principal automáticamente"
+                >
+                  Auto
+                </button>
+                <button
+                  className={`axis-toggle-btn ${chartAxis === "x" ? "active" : ""}`}
+                  onClick={() => setChartAxis("x")}
+                >
+                  Eje X
+                </button>
+                <button
+                  className={`axis-toggle-btn ${chartAxis === "y" ? "active" : ""}`}
+                  onClick={() => setChartAxis("y")}
+                >
+                  Eje Y
+                </button>
+              </div>
+              <div className="legend-pills">
+                <span className="pill pill-orange">Raw</span>
+                <span className="pill pill-purple">Teórico</span>
+                <span className="pill pill-mint">Savitzky-Golay</span>
+              </div>
             </div>
           </div>
           <canvas ref={chartCanvasRef} width={600} height={220} className="chart-canvas" />
